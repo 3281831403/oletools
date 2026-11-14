@@ -235,6 +235,10 @@ from __future__ import print_function
 #                        for issue #619)
 # 2021-04-14       PL: - added detection of Workbook_BeforeClose (issue #518)
 # 2021-11-09       KJ: - added PROJECTCOMPATVERSION Record on dir Stream
+# 2026-11-15           - deobfuscation is now recursive: decoded strings are
+#                        scanned again for further obfuscation layers (hex,
+#                        Base64, Dridex, StrReverse/Chr VBA expressions) until
+#                        no new string is decoded; --reveal peels all layers
 
 __version__ = '0.60.3'
 
@@ -2501,6 +2505,14 @@ def print_json(json_dict=None, _json_is_first=False, **json_parts):
         print('      ' + line.rstrip())
 
 
+# Maximum number of deobfuscation rounds when decoding nested obfuscation
+# layers (e.g. hex inside base64, itself inside a StrReverse/Chr expression):
+# each decoded string is scanned again for further encoded strings, until no
+# new string is decoded. This constant is only a safety net to guarantee
+# termination on adversarial input, the loop normally stops much earlier.
+MAX_DEOBF_ROUNDS = 10
+
+
 class VBA_Scanner(object):
     """
     Class to scan the source code of a VBA module to find obfuscated strings,
@@ -2539,42 +2551,96 @@ class VBA_Scanner(object):
         auto-executable macros, IOC patterns, obfuscation patterns
         such as hex-encoded strings.
 
+        Obfuscated strings are decoded recursively: each decoded string is
+        scanned again for further obfuscation layers (hex, Base64, Dridex,
+        and VBA expressions such as StrReverse/Chr when deobfuscate=True),
+        until no new string is decoded. Each encoded string is decoded and
+        reported only once, and each decoded string is scanned only once,
+        so scanning the same code twice yields the same results.
+
         :param include_decoded_strings: bool, if True, all encoded strings will be included with their decoded content.
         :param deobfuscate: bool, if True attempt to deobfuscate VBA expressions (slow)
         :return: list of tuples (type, keyword, description)
         (type = 'AutoExec', 'Suspicious', 'IOC', 'Hex String', 'Base64 String' or 'Dridex String')
         """
-        # First, detect and extract hex-encoded strings:
-        self.hex_strings = detect_hex_strings(self.code)
+        self.hex_strings = []
+        self.base64_strings = []
+        self.dridex_strings = []
+        self.vba_strings = []
         # detect if the code contains StrReverse:
-        self.strReverse = False
-        if 'strreverse' in self.code.lower(): self.strReverse = True
-        # Then append the decoded strings to the VBA code, to detect obfuscated IOCs and keywords:
-        for encoded, decoded in self.hex_strings:
-            self.code_hex += '\n' + decoded
-            # if the code contains "StrReverse", also append the hex strings in reverse order:
-            if self.strReverse:
-                # StrReverse after hex decoding:
-                self.code_hex_rev += '\n' + decoded[::-1]
-                # StrReverse before hex decoding:
-                self.code_rev_hex += '\n' + bytes2str(binascii.unhexlify(encoded[::-1]))
-                #example: https://malwr.com/analysis/NmFlMGI4YTY1YzYyNDkwNTg1ZTBiZmY5OGI3YjlhYzU/
-        #TODO: also append the full code reversed if StrReverse? (risk of false positives?)
-        # Detect Base64-encoded strings
-        self.base64_strings = detect_base64_strings(self.code)
-        for encoded, decoded in self.base64_strings:
-            self.code_base64 += '\n' + decoded
-        # Detect Dridex-encoded strings
-        self.dridex_strings = detect_dridex_strings(self.code)
-        for encoded, decoded in self.dridex_strings:
-            self.code_dridex += '\n' + decoded
-        # Detect obfuscated strings in VBA expressions
-        if deobfuscate:
-            self.vba_strings = detect_vba_strings(self.code)
-        else:
-            self.vba_strings = []
-        for encoded, decoded in self.vba_strings:
-            self.code_vba += '\n' + decoded
+        self.strReverse = 'strreverse' in self.code.lower()
+        # Decode obfuscated strings layer by layer: the original code is
+        # scanned first, then every decoded string is scanned again for
+        # deeper obfuscation layers, until no new string is decoded
+        # (MAX_DEOBF_ROUNDS is only a safety net). The found_* sets ensure
+        # each encoded string is reported once, and seen_blobs ensures each
+        # decoded string is scanned once, in a deterministic order.
+        found_hex = set()
+        found_base64 = set()
+        found_dridex = set()
+        found_vba = set()
+        seen_blobs = set([self.code])
+        blobs = [self.code]
+        for _ in range(MAX_DEOBF_ROUNDS):
+            if not blobs:
+                break
+            next_blobs = []
+            for blob in blobs:
+                # if StrReverse is used anywhere, even in a decoded layer,
+                # also consider reversed variants of hex strings:
+                if not self.strReverse and 'strreverse' in blob.lower():
+                    self.strReverse = True
+                # Detect and extract hex-encoded strings:
+                for encoded, decoded in detect_hex_strings(blob):
+                    if encoded in found_hex:
+                        continue
+                    found_hex.add(encoded)
+                    self.hex_strings.append((encoded, decoded))
+                    self.code_hex += '\n' + decoded
+                    if self.strReverse:
+                        # StrReverse after hex decoding:
+                        self.code_hex_rev += '\n' + decoded[::-1]
+                        # StrReverse before hex decoding:
+                        self.code_rev_hex += '\n' + bytes2str(binascii.unhexlify(encoded[::-1]))
+                        #example: https://malwr.com/analysis/NmFlMGI4YTY1YzYyNDkwNTg1ZTBiZmY5OGI3YjlhYzU/
+                    # scan the decoded string again for deeper layers:
+                    for candidate in ((decoded, decoded[::-1]) if self.strReverse else (decoded,)):
+                        if candidate not in seen_blobs:
+                            seen_blobs.add(candidate)
+                            next_blobs.append(candidate)
+                #TODO: also append the full code reversed if StrReverse? (risk of false positives?)
+                # Detect Base64-encoded strings
+                for encoded, decoded in detect_base64_strings(blob):
+                    if encoded in found_base64:
+                        continue
+                    found_base64.add(encoded)
+                    self.base64_strings.append((encoded, decoded))
+                    self.code_base64 += '\n' + decoded
+                    if decoded not in seen_blobs:
+                        seen_blobs.add(decoded)
+                        next_blobs.append(decoded)
+                # Detect Dridex-encoded strings
+                for encoded, decoded in detect_dridex_strings(blob):
+                    if encoded in found_dridex:
+                        continue
+                    found_dridex.add(encoded)
+                    self.dridex_strings.append((encoded, decoded))
+                    self.code_dridex += '\n' + decoded
+                    if decoded not in seen_blobs:
+                        seen_blobs.add(decoded)
+                        next_blobs.append(decoded)
+                # Detect obfuscated strings in VBA expressions
+                if deobfuscate:
+                    for encoded, decoded in detect_vba_strings(blob):
+                        if encoded in found_vba:
+                            continue
+                        found_vba.add(encoded)
+                        self.vba_strings.append((encoded, decoded))
+                        self.code_vba += '\n' + decoded
+                        if decoded not in seen_blobs:
+                            seen_blobs.add(decoded)
+                            next_blobs.append(decoded)
+            blobs = next_blobs
         results = []
         self.autoexec_keywords = []
         self.suspicious_keywords = []
@@ -3708,22 +3774,51 @@ class VBA_Parser(object):
         # Need to collapse long lines:
         deobf_code = vba_collapse_long_lines(self.vba_code_all_modules)
         deobf_code = filter_vba(deobf_code)
-        for kw_type, decoded, encoded in analysis:
-            if kw_type == 'VBA string':
-                #print '%3d occurences: %r => %r' % (deobf_code.count(encoded), encoded, decoded)
-                # need to add double quotes around the decoded strings
-                # after escaping double-quotes as double-double-quotes for VBA:
-                decoded = decoded.replace('"', '""')
-                decoded = '"%s"' % decoded
-                # if the encoded string is enclosed in parentheses,
-                # keep them in the decoded version:
-                if encoded.startswith('(') and encoded.endswith(')'):
-                    decoded = '(%s)' % decoded
-                deobf_code = deobf_code.replace(encoded, decoded)
+        # Replace obfuscated strings layer by layer: the analysis is
+        # recursive, so it also contains the strings hidden inside decoded
+        # content (e.g. hex inside base64 inside hex). Each round of
+        # replacements reveals the next layer in the code, until no encoded
+        # string from the analysis is found anymore (MAX_DEOBF_ROUNDS is
+        # only a safety net to guarantee termination).
+        for _ in range(MAX_DEOBF_ROUNDS):
+            replaced = False
+            for kw_type, decoded, encoded in analysis:
+                if kw_type == 'VBA string':
+                    #print '%3d occurences: %r => %r' % (deobf_code.count(encoded), encoded, decoded)
+                    # need to add double quotes around the decoded strings
+                    # after escaping double-quotes as double-double-quotes for VBA:
+                    decoded = decoded.replace('"', '""')
+                    decoded = '"%s"' % decoded
+                    # if the encoded string is enclosed in parentheses,
+                    # keep them in the decoded version:
+                    if encoded.startswith('(') and encoded.endswith(')'):
+                        decoded = '(%s)' % decoded
+                    if encoded in deobf_code:
+                        deobf_code = deobf_code.replace(encoded, decoded)
+                        replaced = True
+                elif kw_type in ('Hex String', 'Base64 String', 'Dridex string'):
+                    # only replace strings whose decoded content is printable:
+                    if not is_printable(decoded):
+                        continue
+                    # The decoded content is inserted verbatim (without
+                    # escaping quotes), so that the next obfuscation layer
+                    # appears in the code exactly as it was decoded and can
+                    # be matched and replaced in the next round. If the
+                    # encoded string is enclosed in quotes in the code, the
+                    # quotes are replaced as well, so that the decoded
+                    # content does not end up nested inside its own quotes:
+                    encoded_quoted = '"%s"' % encoded
+                    if encoded_quoted in deobf_code:
+                        deobf_code = deobf_code.replace(encoded_quoted, decoded)
+                        replaced = True
+                    elif encoded in deobf_code:
+                        deobf_code = deobf_code.replace(encoded, decoded)
+                        replaced = True
+            if not replaced:
+                break
         # # TODO: there is a bug somewhere which creates double returns '\r\r'
         # deobf_code = deobf_code.replace('\r\r', '\r')
         return deobf_code
-        #TODO: repasser l'analyse plusieurs fois si des chaines hex ou base64 sont revelees
 
 
     def find_vba_forms(self):
