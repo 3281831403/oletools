@@ -72,6 +72,10 @@ __version__ = '0.56.2'
 #--- IMPORTS ------------------------------------------------------------------
 
 import sys, optparse, re, os
+from io import BytesIO
+from tempfile import mkstemp
+
+import olefile
 
 # IMPORTANT: it should be possible to run oletools directly as scripts
 # in any directory without installing them with pip or setup.py.
@@ -89,6 +93,7 @@ from oletools.thirdparty.xglob import xglob
 from oletools.thirdparty.tablestream import tablestream
 
 from oletools import olevba
+from oletools import crypto
 from oletools.olevba import TYPE2TAG
 from oletools.common.log_helper import log_helper
 
@@ -199,21 +204,47 @@ class MacroRaptor(object):
         Scan the VBA macro code to detect if it is malicious
         :return:
         """
-        m = re_autoexec.search(self.vba_code)
-        if m is not None:
-            self.autoexec = True
-            self.autoexec_match = m.group()
-            self.matches.append(m.group())
-        m = re_write.search(self.vba_code)
-        if m is not None:
-            self.write = True
-            self.write_match = m.group()
-            self.matches.append(m.group())
-        m = re_execute.search(self.vba_code)
-        if m is not None:
-            self.execute = True
-            self.execute_match = m.group()
-            self.matches.append(m.group())
+        # The code is scanned as is, but also after decoding the obfuscated
+        # strings it may contain (hex, base64, dridex), so that keywords
+        # hidden within encoded strings are detected too, like olevba does:
+        codes_to_scan = [self.vba_code]
+        strreverse = 'strreverse' in self.vba_code.lower()
+        code_hex = ''
+        for encoded, decoded in olevba.detect_hex_strings(self.vba_code):
+            code_hex += '\n' + decoded
+            if strreverse:
+                # StrReverse after hex decoding:
+                codes_to_scan.append(decoded[::-1])
+                # StrReverse before hex decoding:
+                codes_to_scan.append(olevba.bytes2str(olevba.binascii.unhexlify(encoded[::-1])))
+        codes_to_scan.append(code_hex)
+        for encoded, decoded in olevba.detect_base64_strings(self.vba_code):
+            codes_to_scan.append(decoded)
+        for encoded, decoded in olevba.detect_dridex_strings(self.vba_code):
+            codes_to_scan.append(decoded)
+        for code in codes_to_scan:
+            if not code:
+                continue
+            if not self.autoexec:
+                m = re_autoexec.search(code)
+                if m is not None:
+                    self.autoexec = True
+                    self.autoexec_match = m.group()
+                    self.matches.append(m.group())
+            if not self.write:
+                m = re_write.search(code)
+                if m is not None:
+                    self.write = True
+                    self.write_match = m.group()
+                    self.matches.append(m.group())
+            if not self.execute:
+                m = re_execute.search(code)
+                if m is not None:
+                    self.execute = True
+                    self.execute_match = m.group()
+                    self.matches.append(m.group())
+            if self.autoexec and self.write and self.execute:
+                break
         if self.autoexec and (self.execute or self.write):
             self.suspicious = True
 
@@ -223,6 +254,105 @@ class MacroRaptor(object):
         flags += 'W' if self.write else '-'
         flags += 'X' if self.execute else '-'
         return flags
+
+
+# === FILE ANALYSIS ===========================================================
+
+def is_encrypted(filename, data):
+    """
+    Check if a file is encrypted, whether it is on disk or in memory
+    (e.g. a file within a zip archive).
+
+    :param str filename: path of the file on disk, or its name within a container
+    :param bytes data: file contents in memory, or None if the file is on disk
+    :return: bool
+    """
+    try:
+        if data is not None:
+            # file in memory: only OLE files may be encrypted (OpenXML files
+            # are encrypted within an OLE container):
+            if not olefile.isOleFile(BytesIO(data)):
+                return False
+            return crypto.is_encrypted(olefile.OleFileIO(BytesIO(data)))
+        return crypto.is_encrypted(filename)
+    except Exception:
+        log.debug('Error while checking if the file is encrypted', exc_info=True)
+        return False
+
+
+def decrypt_file(filename, data):
+    """
+    Attempt to decrypt an encrypted file using the default passwords
+    (e.g. "VelvetSweatshop"), like olevba does.
+
+    :param str filename: path of the file on disk, or its name within a container
+    :param bytes data: file contents in memory, or None if the file is on disk
+    :return: path of the temporary file with decrypted contents, or None if
+             decryption failed
+    """
+    temp_encrypted_file = None
+    try:
+        if data is not None:
+            # crypto.decrypt only works with files on disk, so the data must
+            # be written to a temporary file first:
+            fd, temp_encrypted_file = mkstemp(prefix='mraptor-encrypted-')
+            with os.fdopen(fd, 'wb') as file_handle:
+                file_handle.write(data)
+            source = temp_encrypted_file
+        else:
+            source = filename
+        decrypted_file, _ = crypto.decrypt(source, crypto.DEFAULT_PASSWORDS)
+        return decrypted_file
+    except Exception:
+        log.debug('Failed to decrypt the file', exc_info=True)
+        return None
+    finally:
+        if temp_encrypted_file is not None:
+            try:
+                os.unlink(temp_encrypted_file)
+            except Exception:
+                pass
+
+
+def analyze_file(filename, data, container, crypto_nesting=0):
+    """
+    Open a file with VBA_Parser, detect the presence of VBA and Excel 4/XLM
+    macros, and extract the macro source code.
+
+    If the file is encrypted, a decryption with the default passwords is
+    attempted first (like olevba does), so that files protected with a
+    transparent/standard password are analyzed like their decrypted content.
+
+    :param str filename: path of the file on disk, or its name within a container
+    :param bytes data: file contents in memory, or None if the file is on disk
+    :param str container: path of the container (zip archive) if any
+    :param int crypto_nesting: current level of nesting for encrypted files
+    :return: tuple (filetype, contains_macros, macro_code)
+    """
+    # if the file is encrypted, try to decrypt it with the default passwords
+    # first, so that the analysis is performed on the decrypted content:
+    if crypto_nesting < crypto.MAX_NESTING_DEPTH and is_encrypted(filename, data):
+        decrypted_file = decrypt_file(filename, data)
+        if decrypted_file is not None:
+            try:
+                log.info('File is encrypted, analyzing the decrypted content')
+                return analyze_file(decrypted_file, None, container or filename,
+                                    crypto_nesting + 1)
+            finally:
+                try:
+                    os.unlink(decrypted_file)
+                except Exception:
+                    pass
+    vba_parser = olevba.VBA_Parser(filename=filename, data=data, container=container)
+    try:
+        filetype = TYPE2TAG[vba_parser.type]
+        # detect both VBA and Excel 4/XLM macros, so that the quick triage
+        # is consistent with the detailed analysis done by olevba:
+        if not vba_parser.detect_macros():
+            return filetype, False, ''
+        return filetype, True, vba_parser.get_vba_code_all_modules()
+    finally:
+        vba_parser.close()
 
 
 # === MAIN ====================================================================
@@ -298,8 +428,8 @@ def main():
         else:
             filetype = '???'
             try:
-                vba_parser = olevba.VBA_Parser(filename=filename, data=data, container=container)
-                filetype = TYPE2TAG[vba_parser.type]
+                filetype, contains_macros, vba_code_all_modules = analyze_file(
+                    filename, data, container)
             except Exception as e:
                 # log.error('Error when parsing VBA macros from file %r' % full_name)
                 # TODO: distinguish actual errors from non-MSOffice files
@@ -309,18 +439,7 @@ def main():
                 t.write_row(['', '', '', str(e)],
                             colors=[None, None, None, result.color])
                 continue
-            if vba_parser.detect_vba_macros():
-                vba_code_all_modules = ''
-                try:
-                    vba_code_all_modules = vba_parser.get_vba_code_all_modules()
-                except Exception as e:
-                    # log.error('Error when parsing VBA macros from file %r' % full_name)
-                    result = Result_Error
-                    t.write_row([result.name, '', TYPE2TAG[vba_parser.type], full_name],
-                                colors=[result.color, None, None, None])
-                    t.write_row(['', '', '', str(e)],
-                                colors=[None, None, None, result.color])
-                    continue
+            if contains_macros:
                 mraptor = MacroRaptor(vba_code_all_modules)
                 mraptor.scan()
                 if mraptor.suspicious:

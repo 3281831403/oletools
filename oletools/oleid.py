@@ -454,28 +454,48 @@ class OleID(object):
             if vba_parser is not None:
                 vba_parser.close()
             vba_parser = None
-        # Check XLM macros only for Excel file types:
-        if self.ftg.is_excel():
-            # TODO: for now XLM detection only works for files on disk... So we need to reload VBA_Parser from the filename
-            #       To be improved once XLMMacroDeobfuscator can work on files in memory
+        # Check XLM macros for Excel and SLK files:
+        # XLM detection works for files on disk (all supported formats), and
+        # also in memory for OLE files (via plugin_biff) and SLK files.
+        # Only for OpenXML files in memory (e.g. xlsm within a zip archive)
+        # it is not possible yet.
+        vba_parser = None
+        try:
+            # TODO: for now XLM detection with XLMMacroDeobfuscator only works
+            #       for files on disk... So we need to reload VBA_Parser from
+            #       the filename in that case
             if self.file_on_disk:
+                vba_parser = olevba.VBA_Parser(filename=self.filename)
+            else:
+                vba_parser = olevba.VBA_Parser(filename=self.filename, data=self.data)
+        except olevba.FileOpenError:
+            # not a supported file format: it cannot contain XLM macros
+            pass
+        except Exception as e:
+            xlm_indicator.risk = RISK.ERROR
+            xlm_indicator.value = 'Error'
+            xlm_indicator.description = 'Error while checking XLM macros: %s' % str(e)
+        else:
+            is_slk = (vba_parser.type == olevba.TYPE_SLK)
+            if self.ftg.is_excel() or is_slk:
                 try:
-                    vba_parser = olevba.VBA_Parser(filename=self.filename)
-                    if vba_parser.detect_xlm_macros():
-                        xlm_indicator.value = 'Yes'
-                        xlm_indicator.risk = RISK.MEDIUM
-                        xlm_indicator.description = 'This file contains XLM macros. Use olevba to analyse them.'
+                    if self.file_on_disk or is_slk \
+                            or self.ftg.container == ftguess.CONTAINER.OLE:
+                        if vba_parser.detect_xlm_macros():
+                            xlm_indicator.value = 'Yes'
+                            xlm_indicator.risk = RISK.MEDIUM
+                            xlm_indicator.description = 'This file contains XLM macros. Use olevba to analyse them.'
+                    else:
+                        xlm_indicator.risk = RISK.UNKNOWN
+                        xlm_indicator.value = 'Unknown'
+                        xlm_indicator.description = 'For now, XLM macros cannot be detected for OpenXML files in memory, only for files on disk'
                 except Exception as e:
                     xlm_indicator.risk = RISK.ERROR
                     xlm_indicator.value = 'Error'
                     xlm_indicator.description = 'Error while checking XLM macros: %s' % str(e)
-                finally:
-                    if vba_parser is not None:
-                        vba_parser.close()
-            else:
-                xlm_indicator.risk = RISK.UNKNOWN
-                xlm_indicator.value = 'Unknown'
-                xlm_indicator.description = 'For now, XLM macros can only be detected for files on disk, not in memory'
+        finally:
+            if vba_parser is not None:
+                vba_parser.close()
 
         return vba_indicator, xlm_indicator
 

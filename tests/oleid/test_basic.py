@@ -125,17 +125,34 @@ class TestOleIDBasic(unittest.TestCase):
         todo_inconsistent_results = (
             join('olevba', 'sample_with_vba.ppt'),
         )
+        # files that do contain XLM macros, in formats for which XLM detection
+        # also works in memory (OLE and SLK):
+        find_xlm = (
+            join('excel4-macros', 'excel4_sample_macro.xls'),
+            join('excel4-macros', 'excel4_sample_macro.xlt'),
+            join('excel4-macros', 'excel4_sample_macro.slk'),
+            join('excel4-macros', 'excel4_sample_macro_excel5_format.xls'),
+        )
+        # suffixes of OpenXML excel files (XLM detection does not work
+        # in-memory for those yet)
+        openxml_excel_suffixes = ('.xlsx', '.xlsm', '.xlsb', '.xltx', '.xltm',
+                                  '.xlam')
         for filename, value_dict in self.oleids:
-            # TODO: we need a sample file with xlm macros
             before_dot, suffix = splitext(filename)
             if suffix == '.zip':
                 suffix = splitext(before_dot)[1]
             # print('Debugging: {1}, {2} for {0}'
             #       .format(filename, value_dict['vba'], value_dict['xlm']))
 
-            # xlm detection does not work in-memory (yet)
-            # --> xlm is "unknown" for excel files, except some encrypted files
-            self.assertIn(value_dict['xlm'], ('Unknown', 'No'))
+            # xlm detection does not work in-memory for OpenXML files (yet)
+            # --> xlm is "Unknown" for OpenXML excel files
+            if filename in find_xlm:
+                self.assertEqual(value_dict['xlm'], 'Yes')
+            elif value_dict['container'] == CONTAINER.OpenXML \
+                    and suffix in openxml_excel_suffixes:
+                self.assertEqual(value_dict['xlm'], 'Unknown')
+            else:
+                self.assertEqual(value_dict['xlm'], 'No')
 
             # "macro detection" in text files leads to interesting results:
             if filename in todo_inconsistent_results:

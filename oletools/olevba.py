@@ -3378,12 +3378,8 @@ class VBA_Parser(object):
             return self.contains_xlm_macros
         # TODO: check also CSV files for formulas?
         self.xlm_macros = []
-        # check if the file is Excel, otherwise return False
-        if not self.ftg.is_excel():
-            self.contains_xlm_macros = False
-            return False
-        if XLMDEOBFUSCATOR:
-            # XLMMacroDeobfuscator is available, use it:
+        # if the file is Excel and XLMMacroDeobfuscator is available, use it:
+        if XLMDEOBFUSCATOR and self.ftg.is_excel():
             # But it only works with files on disk for now
             if not self.file_on_disk:
                 log.warning('XLMMacroDeobfuscator only works with files on disk, not in memory. Analysis might be less complete.')
@@ -3392,6 +3388,21 @@ class VBA_Parser(object):
                     return self._extract_xlm_xlmdeobf()
                 except Exception:
                     log.error('Error when running XLMMacroDeobfuscator')
+        # if this is a container file (OpenXML, PPT, or a Zip archive
+        # containing OLE files), check all the OLE subfiles, like
+        # detect_vba_macros does:
+        if self.ole_file is None and self.ole_subfiles:
+            self.contains_xlm_macros = False
+            for ole_subfile in self.ole_subfiles:
+                log.debug("ole subfile {}".format(ole_subfile))
+                ole_subfile.no_xlm = self.no_xlm
+                if ole_subfile.detect_xlm_macros():
+                    self.contains_xlm_macros = True
+            return self.contains_xlm_macros
+        # check if the file is Excel, otherwise return False
+        if not self.ftg.is_excel():
+            self.contains_xlm_macros = False
+            return False
         # fall back to plugin_biff:
         if self.ole_file is None:
             # TODO: handle OpenXML here
